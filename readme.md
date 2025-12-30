@@ -67,6 +67,3 @@
    go run ./task2/cmd/task2
    ```
 
-## Notes
-- The Go entry point is `task2/task2.go` and uses the generated binding in `task2/contract/counter.go`.
-- The `count` read happens immediately; the increment may need confirmations before the updated value is visible.
