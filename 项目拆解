@@ -1,0 +1,860 @@
+# 项目拆解
+
+# [Pledge](https://github.com/MetaNodeAcademy/ProjectBreakdown-Pledge/tree/main/Pledge "Pledge")
+
+## PledgePool.sol
+
+凭证代币在 pledgev2/contracts/pledge/DebtToken.sol。
+
+***示例参数***
+
+- 抵押币 BTC 价格：20,000 BUSD
+- 抵押率：150%（martgageRate = 1.5 \* 1e8）
+- 出借人总存入：300,000 BUSD
+- 借款人总抵押：10 BTC
+- 结算后：可借额度 = 200,000 / 1.5 = 133,333 BUSD
+
+### 1) 建池（管理端，多签）
+
+- 合约/方法：PledgePool.createPoolInfo(...)
+- 数据：settleTime/endTime/interestRate/martgageRate=150%/lendToken=BUSD/borrowToken=BTC/...
+- 变量变化：poolBaseInfo.push(...)、poolDataInfo.push(...)
+- 例子：创建一个 “BUSD 借出 / BTC 抵押” 的池
+
+### 2) 募集期出借与抵押（用户侧）
+
+- 出借人入池
+  - 合约/方法：depositLend(pid, 300000)
+  - 结果：lendSupply = 300,000 ，lendInfo.stakeAmount = 300000
+- 借款人抵押
+  - 合约/方法：depositBorrow(pid, 10 BTC)
+  - 结果：borrowSupply = 10 BTC ，borrowInfo.stakeAmount = 10
+
+### 3) 结算（管理端，多签）
+
+- 合约/方法：settle(pid)
+- 内部依据预言机价格计算（抵押币 BTC 价格：20,000 BUSD）：
+  - 抵押价值 = 10 \* 20,000 = 200,000
+  - 可借额度 = 200,000 / 1.5 = 133,333
+- 结果写入：
+  - settleAmountLend = 133,333
+  - settleAmountBorrow = 10 BTC
+  - 池状态 MATCH → EXECUTION
+
+### 4) 超额退款（用户侧）
+
+- 出借人退款
+  - 合约/方法：refundLend(pid)
+  - 计算：超额 = 300,000 - 133,333 = 166,667
+  - 退回：按出借份额分配退款
+  - 变量变化：lendInfo.refundAmount = 166667，lendInfo.hasNoRefund = true
+- 借款人退款
+  - 合约/方法：refundBorrow(pid)
+  - 这里无超额抵押，所以无退款或退 0
+
+### 5) 领取凭证与放款（用户侧）
+
+- 出借人领取 sp
+  - 合约/方法：claimLend(pid)
+  - 内部调用：spCoin.mint(...)，合约在 pledgev2/contracts/pledge/DebtToken.sol
+  - sp 数量 = settleAmountLend = 133333 = totalSpAmount.mul(userShare)
+  - 变量变化：spCoin.mint(用户, 133333)，lendInfo.hasNoClaim = true
+- 借款人领取 jp + 放款
+  - 合约/方法：claimBorrow(pid)
+  - 结果：借款人拿到 133,333 BUSD，并获得 jp 作为剩余抵押的凭证
+  - 变量变化：jpCoin.mint(用户, 200000)，borrowInfo.hasNoClaim = true，转出 133333 BUSD
+
+### 6) 正常到期（管理端，多签）
+
+- 合约/方法：finish(pid)
+- 内部动作：
+  - 卖出部分 BTC → 还本息
+  - 记录 finishAmountLend（出借人可赎回总额）
+  - 记录 finishAmountBorrow（借款人可赎回剩余抵押）
+  - 池状态 EXECUTION → FINISH
+
+### 7) 到期赎回（用户侧）
+
+- 出借人赎回本息
+  - 合约/方法：pledgev2/contracts/pledge/PledgePool.sol withdrawLend(pid, spAmount)
+  - 内部调用：spCoin.burn(...)，合约在 pledgev2/contracts/pledge/DebtToken.sol
+- 借款人赎回剩余抵押
+  - 合约/方法：pledgev2/contracts/pledge/PledgePool.sol withdrawBorrow(pid, jpAmount)
+  - 内部调用：jpCoin.burn(...)，合约在 pledgev2/contracts/pledge/DebtToken.sol
+
+***
+
+### 为第 6、7 步补全具体数值
+
+为保证可计算，这里做明确假设（否则合约结果会随价格/时间/费率变化）：
+
+假设
+
+- 年化利率 interestRate = 10%
+- 借贷周期 90 天（约 0.2466 年）
+- lendFee = 0，borrowFee = 0
+- 到期时 BTC 价格仍为 20,000 BUSD
+- 兑换无滑点（amountIn 精确等于兑换得到的 BUSD）
+
+#### 6) 正常到期 PledgePool.finish(0)（带数值）
+
+已知：
+
+- settleAmountLend = 133,333 BUSD
+- settleAmountBorrow = 10 BTC
+
+局部计算：
+
+- 时间比例 timeRatio = 90/365 ≈ 0.2466
+- 利息 interest = 133,333 \* 10% \* 0.2466 ≈ 3,288 BUSD
+- 本息合计 lendAmount = 133,333 + 3,288 = 136,621 BUSD
+- 需要卖出的 BTC 数量
+
+  amountSell = 136,621 / 20,000 ≈ 6.83105 BTC
+- 剩余抵押
+
+  remaining BTC = 10 - 6.83105 = 3.16895 BTC
+
+全局变量写入：
+
+- data.finishAmountLend = 136,621 BUSD
+- data.finishAmountBorrow = 3.16895 BTC
+- state = FINISH
+
+#### 7) 到期赎回（带数值）
+
+**出借人赎回 PledgePool.withdrawLend(0, 133333)**
+
+- totalSpAmount = 133,333
+- spShare = 133,333 / 133,333 = 1
+- redeemAmount = finishAmountLend \* spShare = 136,621 BUSD
+
+结果：
+
+- spCoin.burn(用户, 133,333)
+- 用户收到 136,621 BUSD
+
+**借款人赎回 PledgePool.withdrawBorrow(0, 200000)**
+
+- totalJpAmount = 200,000
+- jpShare = 200,000 / 200,000 = 1
+- redeemAmount = finishAmountBorrow \* jpShare = 3.16895 BTC
+
+结果：
+
+- jpCoin.burn(用户, 200,000)
+- 用户收到 3.16895 BTC
+
+## PledgePool.sol特色功能
+
+### **1) 多签控制**
+
+**Step 1：申请**
+
+- 在多签合约 multiSignature.sol 里调用：
+
+createApplication(to = PledgePool地址)
+
+- \- 多签记录一个 msgHash = keccak256(申请人, PledgePool地址) 的申请
+
+**Step 2：签名**
+
+- \- 多个 owner 调用：
+
+signApplication(msgHash)
+
+- \- 当签名数 ≥ threshold 就算批准
+
+**Step 3：执行**
+
+- \- 申请人调用 PledgePool.finish(pid)
+- \- validCall 检查 msgHash 是否已被足够签名
+- \- 通过 → 执行 finish
+- \- 不通过 → revert
+
+> 本质上维护一个数组，数组里维护不重复的管理员地址，建立池子后需要往这个数组里添加足够的管理员，每次调用时都会判断这个数组的长度，也就是管理员的个数，只有满足一定个数才能通过校验。这里的多签不是“每次调用都要所有人批准”，它的机制是：对“申请人 + 目标合约”这一对组合做一次多签授权。所有“会影响资金安全、价格、费用、池子状态”的操作，都被多签保护。
+
+### **2) 价格预言机**
+
+- \- 合约：pledgev2/contracts/pledge/BscPledgeOracle.sol
+- \- 作用：给 PledgePool 提供价格（getPrices / getPrice）。
+- \- 在流程中的位置：settle 与 liquidate 会调用 oracle.getPrices 来决定抵押价值。
+- \- 可配置：管理员通过多签设置价格（setPrice）或配置链上喂价器（setAssetsAggregator）。
+
+> 如果这个资产绑定了链上喂价器（assetsMap\[underlying] != 0），就从 Chainlink 读最新价格，否则，就用本地 priceMap\[underlying] 里的人工设置价格。
+
+## PledgePool后端功能和逻辑
+
+### 通过WebSocket长连接实现展示token的实时报价
+
+- HTTP 请求进入后，使用 gorilla/websocket 的升级器把 HTTP 连接升级为 WebSocket：
+  - 读协程：读取客户端消息，如果收到 ping 就**更新心跳时间**并回 pong。
+  - 使用select检查心跳循环和WebSocket的错误：每秒检查一次，如果客户端太久没发送 ping，就断开连接并返回错误提示。
+- 在 API 服务启动时起协程获取第三方的token的报价，连接 KuCoin WebSocket
+  - 订阅 /market/ticker:PLGR-USDT（指定的交易对的ticker）
+  - 将报价信息放入价格通道channel中
+  - 使用select监听错误消息，有错误退出KuCoin WebSocket
+- 入口在 API 服务里启动一个常驻协程，用于“广播价格”。
+  - 启动后持续监听价格通道，每收到一条价格，就遍历当前在线连接并推送。
+
+### 定时任务获取
+
+- UpdateAllPoolInfo（每 2 分钟）
+  - 读链上 pool info，本质上就是获取合约的数组的长度，然后遍历这个数组。
+  ```json 
+      // 每个池的基本信息
+      struct PoolBaseInfo {
+          uint256 settleTime; // 结算时间
+          uint256 endTime; // 结束时间
+          uint256 interestRate; // 池的固定利率，单位是1e8 (1e8)
+          uint256 maxSupply; // 池的最大限额
+          uint256 lendSupply; // 当前实际存款的借款
+          uint256 borrowSupply; // 当前实际存款的借款
+          uint256 martgageRate; // 池的抵押率，单位是1e8 (1e8)
+          address lendToken; // 借款方代币地址 (比如 BUSD..)
+          address borrowToken; // 借款方代币地址 (比如 BTC..)
+          PoolState state; // 状态 'MATCH, EXECUTION, FINISH, LIQUIDATION, UNDONE'
+          IDebtToken spCoin; // sp_token的erc20地址 (比如 spBUSD_1..)
+          IDebtToken jpCoin; // jp_token的erc20地址 (比如 jpBTC_1..)
+          uint256 autoLiquidateThreshold; // 自动清算阈值 (触发清算阈值)
+      }
+      // total base pool
+      // 每个池的数据信息
+      struct PoolDataInfo {
+          uint256 settleAmountLend; // 结算时的实际出借金额
+          uint256 settleAmountBorrow; // 结算时的实际借款金额
+          uint256 finishAmountLend; // 完成时的实际出借金额
+          uint256 finishAmountBorrow; // 完成时的实际借款金额
+          uint256 liquidationAmounLend; // 清算时的实际出借金额
+          uint256 liquidationAmounBorrow; // 清算时的实际借款金额
+      }
+  ```
+
+- UpdateContractPrice（每 1 分钟）
+  - 从上一步pool信息中获取token信息，然后保存的数据库中。
+  - 从数据库中读出token，读预言机合约 getPrice，更新tokenprice，供 UI 展示 BorrowTokenInfo/ LendTokenInfo。
+- Monitor（每 30 分钟）
+  - Monitor 是定时**监控合约地址原生币余额**的守护逻辑：获取 Pool 地址在链上的余额，和阈值比较，低于阈值就发邮件告警，用于运维监控，避免合约地址没足够原生币导致交易失败，合约要转出原生币时，必须自己账户里有原生币余额。
+
+## NFT合约
+
+### 数据准备
+
+- 参与方
+  - 管理员：Admin
+  - 卖家：Alice
+  - 买家：Bob
+  - 另一个买家：Carol
+- NFT 合约
+  - CoolNFT（ERC721）
+- NFT
+  - tokenId=101 属于 Alice
+  - tokenId=202 属于 Alice
+- 初始化
+  - protocolShare = 250（=2.5%）
+  - TOTAL\_SHARE = 10000（basis point）
+  - EIP712Name="EasySwap", EIP712Version="1"
+- 合约部署与配置
+  1. EasySwapVault.initialize()
+  2. EasySwapOrderBook.initialize(250, vault, "EasySwap", "1")
+  3. EasySwapVault.setOrderBook(orderBook)
+  4. Alice 给 Vault 授权（approve）她的 NFT
+
+### matchOrder
+
+- 卖家发起分支：
+  - 买单必须在簿内（orders\[buyOrderKey].order 被校验）
+  - 卖单可以在簿内也可以不在簿内，由 isSellExist 判断
+- 买家发起分支：
+  - 卖单必须在簿内（orders\[sellOrderKey].order 被校验）
+  - 买单可以在簿内也可以不在簿内，由 isBuyExist 判断
+
+### 1) List 卖单：单件固定价
+
+**前端选择**
+
+- 点击“挂牌出售”，选择“固定价、指定 NFT”
+
+**卖单数据**
+
+sellOrder1:
+
+side = List
+
+saleKind = FixedPriceForItem
+
+maker = Alice
+
+nft = (CoolNFT, tokenId=101, amount=1)
+
+price = 1.00 ETH
+
+expiry = 0
+
+salt = 111
+
+**合约调用**
+
+makeOrders(\[sellOrder1])
+
+**关键变量与运算**
+
+- orderKey = hash(order)
+- 规则判断：
+  - maker == msg.sender ✅
+  - price != 0 ✅
+  - salt != 0 ✅
+  - expiry==0 ✅
+  - filledAmount\[orderKey] == 0 ✅
+- List 订单要求 nft.amount == 1 ✅
+- Vault 托管：
+  - depositNFT(orderKey, Alice, CoolNFT, 101)
+  - NFTBalance\[orderKey] = 101
+- 订单入队：
+  - priceTrees\[CoolNFT]\[List] 插入 1.00
+  - orderQueues\[CoolNFT]\[List]\[1.00] 添加该订单
+
+结果
+
+- 订单有效入簿，资产从 Alice → Vault 托管。
+
+### 2) Bid 买单：单件固定价
+
+**前端选择**
+
+- 点击“出价购买”，指定 tokenId=101
+
+**买单数据**
+
+buyOrder1:
+
+side = Bid
+
+saleKind = FixedPriceForItem
+
+maker = Bob
+
+nft = (CoolNFT, tokenId=101, amount=1)
+
+price = 1.10 ETH
+
+expiry = 0
+
+salt = 222
+
+**合约调用**
+
+makeOrders(\[buyOrder1]) // msg.value=1.10 ETH
+
+**关键变量与运算**
+
+- buyPrice = price \* amount = 1.10 \* 1 = 1.10 ETH
+- ETHAmount += buyPrice
+- Vault：depositETH(orderKey, 1.10)
+  - ETHBalance\[orderKey] = 1.10
+- 若 msg.value > ETHAmount 则退差额，本例不退。
+
+结果
+
+- Bob 的 1.10 ETH 被托管到 Vault。
+
+### 3) 撮合分支 A：卖家接受买单
+
+**前端选择**
+
+- 卖家点“接受出价”
+
+**合约调用**
+
+matchOrder(sellOrder1, buyOrder1) // msg.value=0
+
+**关键逻辑与运算**
+
+1. \_isMatchAvailable
+   - sell.side=List, buy.side=Bid ✅
+   - saleKind=FixedPriceForItem ✅
+   - 资产一致 ✅
+   - 未关闭 ✅
+2. \_msgSender == sellOrder.maker（Alice）走卖家分支
+3. fillPrice = buyOrder.price = 1.10
+4. 协议费：
+   - protocolFee = fillPrice \* protocolShare / TOTAL\_SHARE
+   - \= 1.10 \* 250 / 10000 = 0.0275 ETH
+5. 资产转移：
+   - Vault 先 withdrawETH(buyOrderKey, 1.10, orderBook)
+   - Alice 收到 1.10 - 0.0275 = 1.0725 ETH
+   - NFT 从 Vault 取出给 Bob：
+
+     withdrawNFT(sellOrderKey, Bob, CoolNFT, 101)
+
+状态更新
+
+- filledAmount\[sellOrderKey] = 1
+- filledAmount\[buyOrderKey] = 1
+
+结果
+
+- Alice 赚到 1.0725 ETH
+- Bob 拿到 NFT 101
+- 协议费 0.0275 ETH 留在 OrderBook 合约
+
+### 4) 撮合分支 B：买家接受卖单（无已存在买单）
+
+**前端选择**
+
+- 买家点“立即购买”，不先挂 bid
+
+**前置**
+
+- Alice 再挂一个卖单 sellOrder2（tokenId=202，0.80 ETH）
+
+**卖单数据**
+
+sellOrder2:
+
+side = List
+
+saleKind = FixedPriceForItem
+
+maker = Alice
+
+nft = (CoolNFT, tokenId=202, amount=1)
+
+price = 0.80 ETH
+
+expiry = 0
+
+salt = 333
+
+Alice 用 makeOrders 挂单，Vault 托管 NFT 202。
+
+**买家直接成交（无提前挂 bid）**
+
+buyOrder2:
+
+side = Bid
+
+saleKind = FixedPriceForItem
+
+maker = Bob
+
+nft = (CoolNFT, tokenId=202, amount=1)
+
+price = 0.80 ETH
+
+expiry = 0
+
+salt = 444
+
+**合约调用**
+
+matchOrder(sellOrder2, buyOrder2) // msg.value=0.80 ETH
+
+**关键运算**
+
+- isBuyExist = false（因为 buyOrder2 未在订单簿）
+- 要求 msg.value >= fillPrice ✅
+- 协议费：0.80 \* 250 / 10000 = 0.02 ETH
+- Alice 收到 0.78 ETH
+- NFT 202 从 Vault 转到 Bob
+- costValue = buyPrice = 0.80（供外层退差额使用）
+
+结果
+
+- 这是典型“现货买入”，没有提前挂 bid。
+
+### 5) 集合出价：FixedPriceForCollection
+
+**前端选择**
+
+- 点击“对整个系列出价”
+
+**集合买单**
+
+buyOrder3:
+
+side = Bid
+
+saleKind = FixedPriceForCollection
+
+maker = Carol
+
+nft = (CoolNFT, tokenId=0, amount=1) // tokenId 无意义
+
+price = 0.90 ETH
+
+expiry = 0
+
+salt = 555
+
+**合约调用**
+
+makeOrders(\[buyOrder3]) // msg.value=0.90 ETH
+
+目的：对整个 collection 出价，不指定 tokenId
+
+方法：makeOrders + matchOrder
+
+**匹配**
+
+- Alice 有任意 CoolNFT 的 List 单，比如 sellOrder2 (tokenId=202)
+
+**调用：**
+
+matchOrder(sellOrder2, buyOrder3) // msg.value=0
+
+**关键判断**
+
+- \_isMatchAvailable 里：
+  - 如果 buyOrder.saleKind = FixedPriceForCollection
+  - 只要求 collection 相同，不要求 tokenId
+- fillPrice = buyOrder.price = 0.90
+- 协议费：0.90 \* 250 / 10000 = 0.0225 ETH
+- Alice 得 0.8775 ETH
+- Carol 得 NFT 202
+
+结果
+
+- 集合出价被任意 tokenId 的卖单成交
+
+———
+
+### 6) 改单：editOrders（价格上调）
+
+**前端选择**
+
+- 买家点“提高出价”
+
+**合约调用**
+
+editOrders(\[{oldOrderKey=buyOrder1Key, newOrder=newBuyOrder1}])
+
+// msg.value=0.20 ETH
+
+**场景**
+
+- Bob 之前挂过 buyOrder1（1.10 ETH）但未成交
+- 想把价格改成 1.30 ETH
+
+**新订单数据**
+
+newBuyOrder1:
+
+side = Bid (必须一致)
+
+saleKind = FixedPriceForItem
+
+maker = Bob
+
+nft = (CoolNFT, tokenId=101, amount=1)
+
+price = 1.30 ETH
+
+expiry = 0
+
+salt = 666
+
+**关键变量与运算**
+
+- 比较 old/new：side、saleKind、maker、collection、tokenId 必须一致 ✅
+- oldRemainingPrice = oldPrice \* (amount - filled)
+  - \= 1.10 \* 1 = 1.10
+- newRemainingPrice = 1.30 \* 1 = 1.30
+- deltaBidPrice = 0.20
+- Vault 调用：
+  - editETH(oldKey, newKey, 1.10, 1.30, Bob)
+  - 需补 msg.value >= 0.20 ✅
+- 订单簿中 old 删除、新增 new
+
+结果
+
+- Bob 在 Vault 中的托管 ETH 增至 1.30
+
+———
+
+### 7) 撤单：cancelOrders（部分成交/未成交）
+
+**前端选择**
+
+- 买家点“撤销出价”
+
+**合约调用**
+
+cancelOrders(\[orderKey])
+
+**场景**
+
+- Bob 挂了一个 bid：
+  - price=1.0，amount=3，但只成交了 1
+- filledAmount\[orderKey] = 1
+
+**关键运算**
+
+- availNFTAmount = amount - filled = 3 - 1 = 2
+- 可退 ETH：price \* avail = 1.0 \* 2 = 2.0 ETH
+- Vault withdrawETH(orderKey, 2.0, Bob)
+
+结果
+
+- 已成交部分无法撤销，未成交资金退回
+
+———
+
+### 8) 批量撮合：matchOrders
+
+**前端选择**
+
+- 买家点“一键购买多个”
+
+**合约调用**
+
+matchOrders(\[{sellOrder:A, buyOrder:BA}, {sellOrder:B, buyOrder:BB}])
+
+// msg.value = 0.5 + 0.7 = 1.2 ETH
+
+**场景**
+
+- Bob 同时买两件
+- sellOrderA 价 0.5 ETH
+- sellOrderB 价 0.7 ETH
+- Bob 用 matchOrders 一次成交两单
+
+**关键运算**
+
+- 循环 delegatecall matchOrderWithoutPayback(最终同matchOrder一样,也是\_matchOrder方法)
+- buyETHAmount 逐步累加：
+  - 第一次 costValue = 0.5 → buyETHAmount=0.5
+  - 第二次 costValue = 0.7 → buyETHAmount=1.2
+- 最后若 msg.value > buyETHAmount 才退差额
+
+结果
+
+- 两笔原子成交，任何一笔失败都会被记录 BatchMatchInnerError
+
+**使用delegatecall的原因，主要原因有两个：**
+
+1. 逐笔失败不回滚整批
+
+   matchOrders 想做到“某一笔失败只记录错误、继续下一笔”。
+
+   但 Solidity 里内部函数调用无法 try/catch，一旦 revert 会整笔回滚。
+
+   用 delegatecall 变成“外部调用”，就能拿到 (success, data)，失败也不会回滚整批。
+2. 保持 msg.sender 与状态一致(如果使用给外部调用的call,会切换上下文)
+
+   delegatecall 在当前合约上下文执行：
+
+### 9) 查询订单：getOrders / getBestOrder
+
+**前端选择**
+
+- 列表页展示最优报价/分页
+
+**合约调用**
+
+getBestOrder(...)
+
+getOrders(..., count, price, firstOrderKey)
+
+**逻辑点**
+
+- priceTrees 维护价格排序
+- getBestPrice：
+  - Bid 取最高价 last()
+  - List 取最低价 first()
+- getOrders 支持分页
+  - firstOrderKey 用于从某个节点继续
+  - 会跳过过期订单
+  - 对于 FixedPriceForItem 会过滤 tokenId
+
+结果
+
+- 可以按集合+side 拉到最优订单，或分页拉历史队列
+
+### 订单为红黑树加队列为什么要这样设计（意义）
+
+#### 为什么使用红黑树:
+
+1\) 快速找最优价格
+
+- 卖单需要最低价 → priceTrees.first() 直接拿到 0.8
+- 买单需要最高价 → priceTrees.last() 直接拿到最高
+- 红黑树是 O(log N)，不会像数组那样每次遍历找最小/最大
+
+2\) 同价订单要 FIFO
+
+- 同价订单按时间顺序成交
+- 例如 0.8 的队列：A 先挂、E 后挂
+- 撮合时先成交 A，再成交 E
+- 队列就是 O(1) 取 head
+
+3\) 删除价格点要便宜
+
+- 当 0.8 的队列空了，只需从树里移除 0.8
+- 不需要扫描整个订单集合
+
+#### 队列加红黑树:
+
+它实现了“价格排序 + 同价时间顺序”的订单簿：
+
+- 价格排序：用红黑树快速找到最好价格
+- 同价排序：用队列保证同价先来先成交（FIFO）
+
+所以撮合时可以做到：
+
+- 买单：优先最高价
+- 卖单：优先最低价
+- 同价：先挂的先成交
+
+### \_addOrder 做了哪些操作
+
+#### **orderQueues 是嵌套 mapping**
+
+mapping(address => mapping(LibOrder.Side => mapping(Price => LibOrder.OrderQueue)))
+
+orderQueues\[collection]\[side]\[price] 得到一个 OrderQueue { head, tail }
+
+下面给一个多价格、多订单的完整例子，用它解释为什么要用“红黑树 + 队列”的结构。
+
+假设：collection = 0xAAA...111，side = List（卖单）
+
+卖家依次挂了 5 个卖单：
+
+- 订单A：price=0.8，orderKey=0xA1
+- 订单B：price=1.0，orderKey=0xB1
+- 订单C：price=0.9，orderKey=0xC1
+- 订单D：price=1.0，orderKey=0xD1
+- 订单E：price=0.8，orderKey=0xE1
+
+#### 结构结果（完整路径）
+
+**价格树**
+
+priceTrees\[0xAAA...111]\[LibOrder.Side.List] = { 0.8, 0.9, 1.0 }
+
+**队列**
+
+orderQueues\[0xAAA...111]\[LibOrder.Side.List]\[0.8] : head=0xA1, tail=0xE1
+
+orderQueues\[0xAAA...111]\[LibOrder.Side.List]\[0.9] : head=0xC1, tail=0xC1
+
+orderQueues\[0xAAA...111]\[LibOrder.Side.List]\[1.0] : head=0xB1, tail=0xD1
+
+**订单节点（next 指针）**(orderQueues的head,tail节点只是存了key,然后orders这个mappings存了key对应的链表的下个节点)
+
+orders\[0xA1].next = 0xE1
+
+orders\[0xE1].next = SENTINEL
+
+orders\[0xB1].next = 0xD1
+
+orders\[0xD1].next = SENTINEL
+
+&#x20;    orders\[0xC1].next = SENTINEL
+
+## NFT后端逻辑
+
+### 链上同步逻辑
+
+#### 1) 启动阶段（service.Start）
+
+- PreloadCollections()：从集合表筛出 floor\_price\_status=1 的 collection 地址，加载进内存过滤器。
+
+  作用：只处理“已导入”的集合，未导入的链上事件会被忽略。
+  > 这里“已导入”的逻辑就是看 collection 表里的 floor\_price\_status 字段floor\_price\_status = 1（CollectionFloorPriceImported）→ 认为该集合已导入，预加载进过滤器,floor\_price\_status = 0 → 不预加载，链上事件会被过滤掉
+
+#### 2) 链上事件同步（orderbookIndexer.Start）
+
+- SyncOrderBookEventLoop 按区块范围轮询链上日志：
+  - LogMake（新挂单）
+
+    写订单表（订单状态 active）、写活动表（Listing 事件），并把订单信息推入 Redis cache:es:orders:{chain}。
+  - LogCancel（取消）
+
+    更新订单状态为 cancelled，写活动表（Cancel 事件），推一个 Cancel 事件到 cache:es:trade:events:{chain}。
+  - LogMatch（成交）
+
+    更新订单状态为 filled、更新 NFT owner，写活动表（Sale 事件），推 Buy 事件到 cache:es:trade:events:{chain}。
+- UpKeepingCollectionFloorChangeLoop 定时维护 floor price 变更表（清理旧数据、周期落库）。
+  > 每隔 MaxCollectionFloorTimeDifference=10s 会抓一遍所有集合的当前最低价，入到历史表；并定期清理 CollectionFloorTimeRange（60 天）之前的数据。聚合是按 collection 维度做的：SQL 用 group by co.collection\_address，对每个集合取 min(co.price)。并且只统计满足条件的订单：listing + active + 未过期 + maker=owner（还会排除 banned），所以它是“当前时刻的有效挂单最低价”，不是按某个时间段聚合。
+
+#### 3) 订单管理器（orderManager.Start）
+
+- ListenNewListingLoop：消费 cache:es:orders:{chain}
+  - 若订单已过期：更新订单状态 expired，推 Expired 事件到 cache:es:trade:events:{chain}
+  - 若未过期：推 Listing 事件到 cache:es:trade:events:{chain}；加入时间轮等待过期处理
+- orderExpiryProcess：时间轮过期处理
+  - 启动时从 DB 拉所有 active 订单，过期的直接标记 expired 并推 Expired 事件；未过期的加入时间轮
+  - 运行中每秒检查到期，更新订单状态 expired 并推 Expired 事件
+- floorPriceProcess：消费 cache:es:trade:events:{chain}
+  - floorPriceProcess 一直在消费 Redis 的交易事件队列 cache:es:trade:events{chain}。
+  - 内存里为每个 collection 维护一个“按价格排序的队列”（就是一个数组），队首就是最低价。
+  - 每收到一个事件（上架/取消/过期/成交/转移），就更新队列（加/删/重建），然后用 GetMin() 取当前最低价。
+  - 如果最低价有变化，就把新值写回集合表里的 floor\_price 字段。
+  它用事件驱动 + 内存队列，实时维护集合的当前 floor price。
+- listCountProcess：统计集合上架数量
+  - 启动时全量统计并缓存
+  - 之后按事件触发，定期刷新有变化的集合
+
+### web api接口
+
+**用户登录与签名状态**
+
+- \- 入口：EasySwapBackend/src/api/v1/user.go
+- \- 逻辑：EasySwapBackend/src/service/v1/user.go
+- \- 流程：获取登录消息（nonce）→ 用户签名后登录 → 生成 token 存 Redis → 返回登录态
+- \- 用途：为后续接口提供用户身份与签名状态
+
+**Collection 列表与详情**
+
+- \- 入口：EasySwapBackend/src/api/v1/collection.go
+- \- 逻辑：EasySwapBackend/src/service/v1/collection.go
+- \- 功能：获取集合详情、集合内 items 列表、集合级 bids、历史成交、top trait 等
+- \- 特色：items 列表会并发聚合订单信息、图片、last sale、best bid 等多数据源
+
+**Item 详情与属性**
+
+- \- 入口：EasySwapBackend/src/api/v1/collection.go
+- \- 逻辑：EasySwapBackend/src/service/v1/collection.go
+- \- 功能：单个 NFT 的详情、traits、owner、图片、小图缓存
+- \- 其中图片接口使用缓存中间件
+
+**Metadata 刷新**
+
+- \- 入口：EasySwapBackend/src/api/v1/collection.go
+- \- 逻辑：EasySwapBackend/src/service/v1/collection.go
+- \- 实现：写入 Redis 刷新队列（EasySwapBackend/src/service/mq/metadata.go），供同步服务消费
+- \- 目的：触发单个 NFT metadata 的重抓取
+
+**排行榜**
+
+- \- 入口：EasySwapBackend/src/api/v1/ranking.go
+- \- 逻辑：EasySwapBackend/src/service/v1/ranking.go
+- \- 功能：集合排行，接口层带缓存
+
+**活动（Activity）**
+
+- \- 入口：EasySwapBackend/src/api/v1/activity.go
+- \- 逻辑：EasySwapBackend/src/service/v1/activity.go
+- \- 功能：按多链聚合活动/交易记录
+
+**用户资产（Portfolio）**
+
+- \- 入口：EasySwapBackend/src/api/v1/portfolio.go
+- \- 逻辑：EasySwapBackend/src/service/v1/portfolio.go
+- \- 功能：用户拥有的 collection、items、listings、bids
+
+**订单/出价信息**
+
+- \- 入口：EasySwapBackend/src/api/v1/order.go
+- \- 逻辑：EasySwapBackend/src/service/v1/order.go
+- \- 功能：批量查询 bid 订单信息
+
+**核心基础设施**
+
+- \- 服务上下文初始化：EasySwapBackend/src/service/svc/context.go
+- \- DB、Redis、链服务 NodeSrvs 注入
+- \- DAO 数据访问层：EasySwapBackend/src/dao/\*
+- \- 统一封装 MySQL/Redis 查询
+- \- 中间件：EasySwapBackend/src/api/middleware/\*
+- \- 日志、Recover、缓存、可选登录校验
